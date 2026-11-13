@@ -729,20 +729,8 @@ def serve(
         except StartupError as e:
             raise click.ClickException(e.args[0])
 
-        # Start the server
-        url = None
         if root:
             ds.root_enabled = True
-            url = "http://{}:{}{}?token={}".format(
-                host, port, ds.urls.path("-/auth-token"), ds._root_token
-            )
-            click.echo(url)
-        if open_browser:
-            if url is None:
-                # Figure out most convenient URL - to table, database or homepage
-                path = await initial_path_for_datasette(ds)
-                url = f"http://{host}:{port}{path}"
-            webbrowser.open(url)
         uvicorn_kwargs = {
             "host": host,
             "port": port,
@@ -757,7 +745,33 @@ def serve(
         if ssl_certfile:
             uvicorn_kwargs["ssl_certfile"] = ssl_certfile
         server = uvicorn.Server(uvicorn.Config(ds.app(), **uvicorn_kwargs))
-        await server.serve()
+        bound_socket = None
+        try:
+            url_port = port
+            if port == 0 and not uds and (root or open_browser):
+                # Reserve the assigned port and serve the same socket so a
+                # printed or opened URL cannot point to port 0 or lose a race.
+                bound_socket = server.config.bind_socket()
+                url_port = bound_socket.getsockname()[1]
+            url = None
+            if root:
+                url = "http://{}:{}{}?token={}".format(
+                    host, url_port, ds.urls.path("-/auth-token"), ds._root_token
+                )
+                click.echo(url)
+            if open_browser:
+                if url is None:
+                    # Figure out most convenient URL - to table, database or homepage
+                    path = await initial_path_for_datasette(ds)
+                    url = f"http://{host}:{url_port}{path}"
+                webbrowser.open(url)
+            if bound_socket is None:
+                await server.serve()
+            else:
+                await server.serve(sockets=[bound_socket])
+        finally:
+            if bound_socket is not None:
+                bound_socket.close()
 
     asyncio.run(_serve_async())
 

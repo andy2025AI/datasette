@@ -1,3 +1,5 @@
+import json
+import re
 import signal
 import socket
 import subprocess
@@ -226,3 +228,101 @@ def test_sigint_runs_shutdown_hooks(serve_with_plugins, tmp_path):
         "shutdown hook never wrote its sentinel file after SIGINT\n" + output
     )
     assert sentinel_path.read_text("utf-8") == "shutdown ran"
+
+
+PORT_REPORT_PLUGIN = """
+import json
+import pathlib
+from urllib.parse import urlsplit
+from datasette import hookimpl
+import uvicorn
+import webbrowser
+
+REPORT = pathlib.Path({report_path!r})
+
+
+def write_report(**values):
+    data = json.loads(REPORT.read_text("utf-8")) if REPORT.exists() else dict()
+    data.update(values)
+    REPORT.write_text(json.dumps(data), "utf-8")
+
+
+def capture_browser(url):
+    write_report(browser_port=urlsplit(url).port)
+    return True
+
+
+@hookimpl
+def asgi_wrapper(datasette):
+    write_report(root_enabled_at_app=datasette.root_enabled)
+    return lambda app: app
+
+
+webbrowser.open = capture_browser
+original_startup = uvicorn.Server.startup
+
+
+async def capture_startup(self, sockets=None):
+    await original_startup(self, sockets=sockets)
+    if self.started:
+        write_report(bound_port=self.servers[0].sockets[0].getsockname()[1])
+
+
+uvicorn.Server.startup = capture_startup
+"""
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("automatic_port", (False, True))
+@pytest.mark.parametrize(
+    "flags",
+    ((), ("--open",), ("--root",), ("--root", "--open")),
+    ids=("plain", "open", "root", "root-open"),
+)
+def test_serve_urls_use_bound_port(serve_with_plugins, tmp_path, automatic_port, flags):
+    report_path = tmp_path / "ports.json"
+    extra_args = ("--port", "0") if automatic_port else ()
+    process, configured_port = serve_with_plugins(
+        {"port_report": PORT_REPORT_PLUGIN.format(report_path=str(report_path))},
+        *extra_args,
+        *flags,
+        wait_for_startup=False,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        report = {}
+        while time.monotonic() < deadline:
+            assert process.poll() is None, "server exited before binding"
+            try:
+                report = json.loads(report_path.read_text("utf-8"))
+            except (OSError, ValueError):
+                pass
+            if "bound_port" in report:
+                break
+            time.sleep(0.05)
+        assert "bound_port" in report
+        bound_port = report["bound_port"]
+        assert bound_port > 0
+        response = httpx2.get(
+            f"http://127.0.0.1:{bound_port}/_memory.json", trust_env=False
+        )
+        assert response.status_code == 200
+        assert report["root_enabled_at_app"] == ("--root" in flags)
+        if not automatic_port:
+            assert bound_port == configured_port
+        if "--open" in flags:
+            assert report["browser_port"] == bound_port
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            stdout, _ = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise AssertionError("server did not stop after SIGTERM")
+    if "--root" in flags:
+        # Compare the port without including the authentication token in failures.
+        printed = re.search(rb"^http://127\.0\.0\.1:(\d+)/", stdout, re.MULTILINE)
+        assert printed is not None
+        assert int(printed.group(1)) == bound_port
